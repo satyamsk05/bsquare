@@ -1,6 +1,11 @@
 import requests
 import random
+import logging
+import re
 from app.config import OPENROUTER_API_KEY, GROQ_API_KEY, MAX_POST_LENGTH
+
+# Setup logger
+logger = logging.getLogger(__name__)
 
 # Free models — pehla try karo, fail ho to agla
 FREE_MODELS = [
@@ -19,6 +24,27 @@ GROQ_MODELS = [
     "mixtral-8x7b-32768",
 ]
 
+def clean_markdown(text: str) -> str:
+    """
+    Binance Square supports VERY limited markdown (basically none).
+    This function removes common markdown symbols to keep the post clean.
+    """
+    # Remove bold, italics, strikes
+    text = re.sub(r'(\*\*|__|\*|_|~~)', '', text)
+    # Remove headers (e.g., #, ##, ###)
+    text = re.sub(r'^#+\s+', '', text, flags=re.MULTILINE)
+    # Remove list markers (e.g., *, -, 1., 2.)
+    text = re.sub(r'^[*-]\s+', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^\d+\.\s+', '', text, flags=re.MULTILINE)
+    # Remove blockquotes
+    text = re.sub(r'^>\s+', '', text, flags=re.MULTILINE)
+    # Remove code blocks
+    text = re.sub(r'(`{1,3}).*?\1', '', text, flags=re.DOTALL)
+    # Remove links [text](url) -> text
+    text = re.sub(r'\[(.*?)\]\(.*?\)', r'\1', text)
+    # Remove excessive empty lines
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
 
 def _call_groq(prompt: str) -> str:
     """Groq API call — Primary speed king"""
@@ -41,21 +67,24 @@ def _call_groq(prompt: str) -> str:
                 },
                 timeout=20
             )
+            response.raise_for_status()
             data = response.json()
             if "choices" in data and data["choices"]:
-                content = data["choices"][0]["message"].get("content")
+                content = data["choices"][0].get("message", {}).get("content")
                 if content:
-                    print(f"Groq model used: {model}")
+                    logger.info(f"Groq model used: {model}")
                     return content.strip()
             elif "error" in data:
-                print(f"Groq {model} error: {data['error'].get('message', '')}")
+                logger.warning(f"Groq {model} error: {data['error'].get('message', '')}")
         except Exception as e:
-            print(f"Groq {model} exception: {e}")
+            logger.warning(f"Groq {model} exception: {e}")
     raise Exception("All Groq models failed")
-
 
 def _call_openrouter(prompt: str) -> str:
     """Free models mein se koi ek try karo — fallback ke saath"""
+    if not OPENROUTER_API_KEY:
+        raise Exception("OPENROUTER_API_KEY not found")
+
     last_error = None
     for model in FREE_MODELS:
         try:
@@ -72,22 +101,22 @@ def _call_openrouter(prompt: str) -> str:
                 },
                 timeout=30
             )
+            response.raise_for_status()
             data = response.json()
             if "choices" in data and data["choices"]:
-                content = data["choices"][0]["message"].get("content")
+                content = data["choices"][0].get("message", {}).get("content")
                 if content:
-                    print(f"OpenRouter model used: {model}")
+                    logger.info(f"OpenRouter model used: {model}")
                     return content.strip()
                 else:
-                    print(f"Model {model} returned empty content — trying next...")
+                    logger.warning(f"Model {model} returned empty content — trying next...")
             elif "error" in data:
-                print(f"Model {model} error: {data['error'].get('message', '')} — trying next...")
+                logger.warning(f"Model {model} error: {data['error'].get('message', '')} — trying next...")
                 last_error = data["error"].get("message", "Unknown error")
         except Exception as e:
-            print(f"Model {model} exception: {e} — trying next...")
+            logger.warning(f"Model {model} exception: {e} — trying next...")
             last_error = str(e)
     raise Exception(f"All OpenRouter models failed. Last error: {last_error}")
-
 
 def generate_content(prompt: str) -> str:
     """
@@ -97,14 +126,18 @@ def generate_content(prompt: str) -> str:
         # 1. Try Groq first (fastest)
         return _call_groq(prompt)
     except Exception as e:
-        print(f"Groq failed (falling back to OpenRouter): {e}")
+        # If OpenRouter key isn't present, don't attempt fallback.
+        if not OPENROUTER_API_KEY:
+            logger.error(f"Groq failed and OpenRouter key missing: {e}")
+            raise
+
+        logger.error(f"Groq failed (falling back to OpenRouter): {e}")
         try:
             # 2. Try OpenRouter (reliable fallback)
             return _call_openrouter(prompt)
         except Exception as e2:
-            print(f"Both AI providers failed: {e2}")
+            logger.error(f"Both AI providers failed: {e2}")
             raise e2
-
 
 # =============================================
 # VIRAL HOOKS — Post ki pehli line
@@ -161,7 +194,6 @@ GAINER_STYLES = [
     "confident commentator calling the move live",
 ]
 
-
 def write_gainers_post(gainers: list, forced_sentiment: str = None) -> str:
     """
     Viral-style gainers post — strong hook, clean data, sharp close
@@ -204,12 +236,11 @@ INSTRUCTIONS:
 
     try:
         content = generate_content(prompt)
-        # Clean up any markdown that may have slipped through
-        content = content.replace("**", "").replace("__", "").replace("##", "").replace("*", "")
+        content = clean_markdown(content)
         return content[:MAX_POST_LENGTH]
 
     except Exception as e:
-        print(f"Gainers writer error: {e}")
+        logger.error(f"Gainers writer error: {e}")
         # Sharp fallback
         lines = [hook, ""]
         for i, g in enumerate(gainers):
@@ -217,7 +248,6 @@ INSTRUCTIONS:
         lines.append("")
         lines.append("Which move would you have caught?")
         return "\n".join(lines)
-
 
 def write_news_post(news: dict, forced_sentiment: str = None) -> str:
     """
@@ -261,12 +291,11 @@ RULES:
 
     try:
         content = generate_content(prompt)
-        # Clean up any markdown
-        content = content.replace("**", "").replace("__", "").replace("##", "").replace("*", "")
+        content = clean_markdown(content)
         return content[:MAX_POST_LENGTH]
 
     except Exception as e:
-        print(f"News writer error: {e}")
+        logger.error(f"News writer error: {e}")
         # Sharp fallback
         title = news['title']
         desc = news.get('description', '')[:600]

@@ -9,8 +9,12 @@ Telegram Approval System — News posts ke liye
 
 import requests
 import time
+import logging
 from typing import Optional, Tuple
 from app.config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+
+# Setup logger
+logger = logging.getLogger(__name__)
 
 BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 TIMEOUT_SECONDS = 600  # 10 minutes
@@ -44,17 +48,18 @@ def _send_with_buttons(text: str, approve_key: str, refresh_key: str, edit_key: 
     }
     try:
         r = requests.post(f"{BASE_URL}/sendMessage", json=payload, timeout=10)
+        r.raise_for_status()
         data = r.json()
         if data.get("ok"):
             return data["result"]["message_id"]
         else:
-            print(f"Telegram send error: {data}")
+            logger.warning(f"Telegram send error: {data}")
             # Fallback to plain text if HTML fails
             payload["parse_mode"] = None
             r = requests.post(f"{BASE_URL}/sendMessage", json=payload, timeout=10)
             return r.json().get("result", {}).get("message_id")
     except Exception as e:
-        print(f"Telegram send exception: {e}")
+        logger.error(f"Telegram send exception: {e}")
         return None
 
 
@@ -77,8 +82,10 @@ def _send_simple(text: str, parse_mode: str = None) -> Optional[int]:
             "text": text[:4096],
             "parse_mode": parse_mode
         }, timeout=10)
+        r.raise_for_status()
         return r.json().get("result", {}).get("message_id")
-    except Exception:
+    except Exception as e:
+        logger.error(f"Telegram send simple error: {e}")
         return None
 
 
@@ -101,27 +108,28 @@ def _send_tone_menu(message_id: int):
         }
     }
     try:
-        requests.post(f"{BASE_URL}/editMessageReplyMarkup", json=payload, timeout=10)
-    except Exception:
-        pass
+        requests.post(f"{BASE_URL}/editMessageReplyMarkup", json=payload, timeout=10).raise_for_status()
+    except Exception as e:
+        logger.error(f"Telegram tone menu error: {e}")
 
 
 def _get_latest_offset() -> int:
     """Current update offset lo"""
     try:
         r = requests.get(f"{BASE_URL}/getUpdates", params={"limit": 1, "timeout": 0}, timeout=10)
+        r.raise_for_status()
         updates = r.json().get("result", [])
         if updates:
             return updates[-1]["update_id"] + 1
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Error getting latest offset: {e}")
     return 0
 
 
 def _poll_for_decision(approve_key: str, refresh_key: str, edit_key: str, offset: int, deadline: float) -> tuple:
     """
     Returns: (decision, data, last_offset)
-    Decisions: "approve", "refresh", "edit_request", "timeout"
+    Decisions: "approve", "refresh", "edit_request", "tone_menu", "tone_selected", "timeout"
     """
     current_offset = offset
     while time.time() < deadline:
@@ -133,6 +141,7 @@ def _poll_for_decision(approve_key: str, refresh_key: str, edit_key: str, offset
                 params={"offset": current_offset, "timeout": poll_timeout},
                 timeout=poll_timeout + 5
             )
+            r.raise_for_status()
             updates = r.json().get("result", [])
             for update in updates:
                 current_offset = update["update_id"] + 1
@@ -141,7 +150,11 @@ def _poll_for_decision(approve_key: str, refresh_key: str, edit_key: str, offset
                 cb = update.get("callback_query")
                 if cb:
                     data = cb.get("data", "")
-                    requests.post(f"{BASE_URL}/answerCallbackQuery", json={"callback_query_id": cb["id"]}, timeout=5)
+                    # Confirm receipt
+                    try:
+                        requests.post(f"{BASE_URL}/answerCallbackQuery", json={"callback_query_id": cb["id"]}, timeout=5)
+                    except Exception:
+                        pass
                     
                     if data == approve_key:
                         return "approve", None, current_offset
@@ -155,7 +168,7 @@ def _poll_for_decision(approve_key: str, refresh_key: str, edit_key: str, offset
                         return "tone_selected", data.replace("tone_", ""), current_offset
                 
         except Exception as e:
-            print(f"Poll error: {e}")
+            logger.warning(f"Poll error: {e}")
             time.sleep(2)
 
     return "timeout", None, current_offset
@@ -175,6 +188,7 @@ def _wait_for_text_edit(offset: int, deadline: float) -> tuple:
                 params={"offset": current_offset, "timeout": poll_timeout},
                 timeout=poll_timeout + 5
             )
+            r.raise_for_status()
             updates = r.json().get("result", [])
             for update in updates:
                 current_offset = update["update_id"] + 1
@@ -184,7 +198,8 @@ def _wait_for_text_edit(offset: int, deadline: float) -> tuple:
                     if text:
                         if instructions_id: _delete_message(instructions_id)
                         return text, current_offset
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Wait for edit error: {e}")
             time.sleep(1)
             
     if instructions_id: _delete_message(instructions_id)
@@ -193,6 +208,10 @@ def _wait_for_text_edit(offset: int, deadline: float) -> tuple:
 
 def request_news_approval(post_content: str, generate_fn, post_fn) -> bool:
     """Main Telegram approval loop with Edit support"""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.error("Telegram token/chat id missing; cannot request approval.")
+        return False
+
     current_post = post_content
     offset = _get_latest_offset()
     attempt = 0
@@ -203,16 +222,16 @@ def request_news_approval(post_content: str, generate_fn, post_fn) -> bool:
         refresh_key = f"refresh_{attempt}"
         edit_key = f"edit_{attempt}"
 
-        print(f"Sending news post for approval (attempt {attempt})...")
+        logger.info(f"Sending news post for approval (attempt {attempt})...")
         msg_id = _send_with_buttons(current_post, approve_key, refresh_key, edit_key)
 
         if msg_id is None:
-            print("Telegram unavailable, posting directly...")
+            logger.error("Telegram unavailable, posting directly (fail-safe)...")
             url = post_fn(current_post)
             return url is not None
 
         deadline = time.time() + TIMEOUT_SECONDS
-        decision, _, offset = _poll_for_decision(approve_key, refresh_key, edit_key, offset, deadline)
+        decision, tone_data, offset = _poll_for_decision(approve_key, refresh_key, edit_key, offset, deadline)
 
         if decision == "edit_request":
             new_text, offset = _wait_for_text_edit(offset, deadline)
@@ -227,7 +246,7 @@ def request_news_approval(post_content: str, generate_fn, post_fn) -> bool:
 
         if decision == "tone_menu":
             _send_tone_menu(msg_id)
-            # Short poll for tone selection
+            # Short poll for tone selection within same deadline
             decision, tone_data, offset = _poll_for_decision(approve_key, refresh_key, edit_key, offset, deadline)
             if decision == "tone_selected" and tone_data != "back":
                 _delete_message(msg_id)
@@ -235,6 +254,7 @@ def request_news_approval(post_content: str, generate_fn, post_fn) -> bool:
                 try:
                     current_post = generate_fn(sentiment=tone_data)
                 except Exception as e:
+                    logger.error(f"Regen with tone failed: {e}")
                     _send_simple(f"❌ Regen failed: {e}")
                 continue
             else:
@@ -244,7 +264,7 @@ def request_news_approval(post_content: str, generate_fn, post_fn) -> bool:
         _delete_message(msg_id)
 
         if decision == "approve":
-            print("User approved!")
+            logger.info("User approved news post.")
             _send_simple("⏳ <b>Posting to Binance Square...</b>", parse_mode="HTML")
             url = post_fn(current_post)
             if url:
@@ -255,20 +275,23 @@ def request_news_approval(post_content: str, generate_fn, post_fn) -> bool:
                 return False
 
         elif decision == "refresh":
+            logger.info("User requested refresh.")
             _send_simple("🔄 <b>Generating fresh post...</b>", parse_mode="HTML")
             try:
                 current_post = generate_fn()
             except Exception as e:
+                logger.error(f"Manual refresh failed: {e}")
                 _send_simple(f"❌ Generate failed: {e}")
             continue
 
         else:  # timeout
-            print("10 min timeout — auto-posting...")
+            logger.info("10 min timeout reached — auto-posting...")
             _send_simple("⏰ <b>10 min timeout — auto-posting now...</b>", parse_mode="HTML")
             url = post_fn(current_post)
             if url:
                 _send_simple(f"✅ <b>Auto-posted!</b>\n{url}", parse_mode="HTML")
                 return True
             else:
+                logger.error("Auto-post failed.")
                 _send_simple("❌ <b>Auto-post failed.</b>", parse_mode="HTML")
                 return False
